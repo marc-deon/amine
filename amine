@@ -1,0 +1,815 @@
+#!/usr/bin/env python
+
+# Version 2024-05-06
+
+# API Reference: https://myanimelist.net/apiconfig/references/api/v2#section/Authentication
+
+CLIENT_ID = ""
+CLIENT_SECRET = ""
+
+default_config = {
+    "play_command": "mpv --video-sync=display-resample",
+    "hotkeys":{
+        "u" : ["update_archive", "update_pages"],
+        "q" : "amine_quit",
+        "C" : "mark_completed",
+        "D" : "mark_dropped",
+        "W" : "mark_watching",
+        "p" : "add_path",
+        "n" : "increment_episode",
+        "\n": "try_play",
+        "?" : "show_hotkeys",
+        "m" : "open_mal",
+        "f" : "open_folder"
+    }
+}
+
+import requests
+import json
+import curses
+import curses.ascii
+import os
+import secrets
+import datetime
+import sys
+
+import enum
+class Status (enum.IntEnum):
+    watching = 0
+    completed = enum.auto()
+    on_hold = enum.auto()
+    dropped = enum.auto()
+    plan_to_watch = enum.auto()
+
+class AmineError (enum.IntEnum):
+    none = 0
+    Error = enum.auto()
+    PlayerError = enum.auto()
+
+ERRORS = {
+    1: "Error initializing MPV",
+    2: "File couldn't be played",
+    3: "Some files couldn't be played",
+    4: "Quit Signal",
+    200: "All good",
+}
+
+# They get shuffled around in the enum
+status_names = [
+    "watching",
+    "completed",
+    "on_hold",
+    "dropped",
+    "plan_to_watch"
+]
+
+# Read default locales
+import locale
+locale.setlocale(locale.LC_ALL, '')
+
+dow_names = {
+    'sunday':    '日',
+    'monday':    '月',
+    'tuesday':   '火',
+    'wednesday': '水',
+    'thursday':  '木',
+    'friday':    '金',
+    'saturday':  '土',
+    '': '　'
+}
+
+dow_nums = {x:i for i, x in enumerate(dow_names)}
+
+messages = [[""]]
+
+def add_message(*args, **kwargs):
+    error = kwargs['error'] if 'error' in kwargs else AmineError.none
+    args = [str(error)] + [x for x in args]
+    messages.append([*args, error])
+
+if 'DISPLAY' not in os.environ:
+    os.environ['DISPLAY'] = ':0'
+    os.environ['DBUS_SESSION_BUS_ADDRESS'] = 'unix:path=/run/user/1000/bus'
+
+def ReadConfig():
+    config = json.load(open(os.path.join(CONFIG_ROOT, "config.json")))
+    for key in default_config.keys():
+        if key not in config:
+            config[key] = default_config[key]
+    return config
+
+def get_files(path:str, ignore_suffixes=["ass", "md5", "py"]):
+    a = [os.path.join(path,f) for f in os.listdir(path) if os.path.isfile(os.path.join(path, f))]
+    a = [x for x in a if not any([x.endswith(suffix) for suffix in ignore_suffixes])]
+    return a
+
+
+CONFIG_ROOT = os.path.expanduser("~/.config/amine")
+general_config = ReadConfig()
+if "anime_root" in general_config:
+    try:
+        get_files(general_config["anime_root"])
+    except:
+        messages.append((f"Problem getting files in {general_config['anime_root']}",))
+        general_config["anime_root"] = None
+else:
+    messages.append(("anime_root not set in config",))
+    general_config["anime_root"] = None
+
+ARCHIVE_PREFIX = "anime-"
+ARCHIVE_SUFFIX = "-archive.json"
+TOKEN_NAME = "token.json"
+
+
+# Placeholders
+page = 0
+cursor = 0
+offset = 0
+token = None
+
+#archives = [{} for status in dir(Status) if status[0] != "_"]
+archives = [{} for _ in status_names]
+# An arbitrary, longish title
+maxColumnSize = len("Sono Bisque Doll wa Koi wo Suru")
+
+# List of 2tuples: pagename, title-list; avoid private variables
+pages = [(status.replace('_', ' '), []) for status in status_names if status[0] != "_"]
+
+def open_mal(**kwargs):
+    """Open MyAnimeList page for selected show in web browser."""
+    show = archives[page][pages[page][1][cursor]]
+    id = show["id"]
+    os.system(f"xdg-open https://myanimelist.net/anime/{id}/")
+
+
+def open_folder(**kwargs):
+    """Open local folder for selected show in file browser."""
+    show = archives[page][pages[page][1][cursor]]
+    try:
+        path = os.path.join(general_config["anime_root"], show["path"])
+    except KeyError:
+        return
+    os.system(f"xdg-open 'file://{path}' & disown")
+
+
+def get_new_code_verifier():
+    token = secrets.token_urlsafe(100)
+    return token[:128]
+
+
+def print_new_authorisation_url(code_challenge:str):
+    global CLIENT_ID, CLIENT_SECRET
+
+
+def print_new_authorisation_url(code_challenge:str):
+    global CLIENT_ID, CLIENT_SECRET
+
+    url = f'https://myanimelist.net/v1/oauth2/authorize?response_type=code&client_id={CLIENT_ID}&code_challenge={code_challenge}'
+    print(f'Authorise your application by clicking here: {url}\n')
+
+# 3. Once you've authorised your application, you will be redirected to the webpage you've
+#    specified in the API panel. The URL will contain a parameter named "code" (the Authorisation
+#    Code). You need to feed that code to the application.
+def generate_new_token(authorisation_code: str, code_verifier: str) -> dict:
+    global CLIENT_ID, CLIENT_SECRET
+
+    url = 'https://myanimelist.net/v1/oauth2/token'
+    data = {
+        'client_id': CLIENT_ID,
+        'client_secret': CLIENT_SECRET,
+        'code': authorisation_code,
+        'code_verifier': code_verifier,
+        'grant_type': 'authorization_code'
+    }
+
+    response = requests.post(url, data)
+    response.raise_for_status()  # Check whether the requests contains errors
+
+    token = response.json()
+    response.close()
+    print('Token generated successfully!')
+
+    with open('/'.join([CONFIG_ROOT, TOKEN_NAME]), 'w') as file:
+        json.dump(token, file, indent = 4)
+        print('Token saved in "token.json"')
+
+    return token
+
+
+def refresh_token(refresh_token:str) -> dict:
+    global token
+    url = "https://myanimelist.net/v1/oauth2/token"
+
+    data = {
+            "client_id": CLIENT_ID,
+            "client_secret": CLIENT_SECRET,
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token
+    }
+
+    response = requests.post(url, data=data)
+    response.raise_for_status()
+
+    token = response.json()
+    response.close()
+    print("Token refreshed successfully!")
+
+    with open('/'.join([CONFIG_ROOT, TOKEN_NAME]), 'w') as file:
+        json.dump(token, file, indent = 4)
+        print('Token saved in "token.json"')
+
+    token["aquired"] = datetime.datetime.now()
+    return token
+
+
+def retrieve_token():
+    with open('/'.join([CONFIG_ROOT, TOKEN_NAME]), 'r') as file:
+        return json.loads(file.read())
+
+
+def save_token():
+    temp = token["aquired"]
+    token["aquired"] = repr(temp)
+    with open('/'.join([CONFIG_ROOT, TOKEN_NAME]), 'w') as file:
+        file.write(json.dumps(token))
+    token["aquired"] = temp
+    pass
+
+
+def retrieve_archive(archive_type:Status):
+    archname = '/'.join([CONFIG_ROOT, ARCHIVE_PREFIX+archive_type.name+ARCHIVE_SUFFIX])
+    try:
+        with open(archname, 'r') as file:
+            pass
+    except FileNotFoundError:
+        with open(archname, 'w') as file:
+            file.write("{}")
+
+
+    with open(archname, 'r') as file:
+        return json.loads(file.read())
+
+
+def save_archive(archive):
+    page = 0
+    while archives[page] != archive:
+        page+=1
+    archname = '/'.join([CONFIG_ROOT, ARCHIVE_PREFIX+Status(page).name+ARCHIVE_SUFFIX])
+    with open(archname, 'w') as file:
+        file.write(json.dumps(archive))
+
+
+
+def get_list_status(access_token:str, status:str=""):
+    url = 'https://api.myanimelist.net/v2/users/@me/animelist?limit=1000&fields=status,list_status,broadcast&nsfw=true'
+
+    if status:
+        url += '&status='+status
+
+    response = requests.get(url, headers = {
+    'Authorization': f"Bearer {access_token}",
+    })
+    response.raise_for_status()
+    anim_list = response.json()
+    response.close()
+
+    # with open("/home/maqo/listresponse.json", 'w') as file:
+    #     file.write(json.dumps(response.json()))
+
+    return anim_list['data']
+
+
+def get_anime_episode_count(access_token:str, id:int):
+    url = f'https://api.myanimelist.net/v2/anime/{id}?fields=num_episodes'
+    response = requests.get(url, headers = {
+        'Authorization': f"Bearer {access_token}",
+    })
+    response.raise_for_status()
+    num = int(response.json()['num_episodes'])
+    response.close()
+    return num
+
+
+def get_anime_year(access_token:str, id:int):
+    # Maison Ikkoku requires workaround?
+    #if id == 1453:
+    #    return 1986
+
+    url = f'https://api.myanimelist.net/v2/anime/{id}?fields=start_date'
+    response = requests.get(url, headers = {
+        'Authorization': f"Bearer {access_token}",
+    })
+    response.raise_for_status()
+    num = response.json()['start_date'].split('-')[0]
+    response.close()
+    return num
+
+def set_anime_episodes(access_token:str, id:int, val:int):
+    return requests.put(
+        f'https://api.myanimelist.net/v2/anime/{id}/my_list_status',
+        headers = {"Authorization": f"Bearer {access_token}"},
+        data = {"num_watched_episodes": val }
+    )
+
+def mark_completed(screen, token:str, drop:bool=False, watch:bool=False, title=None, **kwargs) -> None:
+    """Mark given anime as completed."""
+    title = title or pages[page][1][cursor]
+
+    status = "watching" if watch else "dropped" if drop else "completed"
+    statusEnum = Status.watching if watch else Status.dropped if drop else Status.completed
+
+    archives[page][title]["status"] = status
+    entry = archives[page].pop(title)
+    a = archives[statusEnum]
+
+    a[title] = entry
+
+    save_archive(archives[page])
+    save_archive(a)
+
+    pages[page][1].remove(title)
+    pages[statusEnum][1].append(title)
+
+    id = entry["id"]
+    requests.put(
+        f"https://api.myanimelist.net/v2/anime/{id}/my_list_status",
+        headers = {"Authorization": f"Bearer {token}"},
+        data = {"status": status }
+    )
+
+    add_message(f"marked {title} completed")
+
+    update_pages()
+    screen.clear()
+
+
+def mark_dropped(screen, token, **kwargs):
+    """Mark given anime as dropped."""
+    mark_completed(screen, token["access_token"], drop=True)
+
+def mark_watching(screen, token, **kwargs):
+    """Mark given anime as watching."""
+    mark_completed(screen, token["access_token"], watch=True)
+
+def ShowSort(x, a):
+    # Sort Airing shows first
+    zeroth = not ("air_status" in a[x] and a[x]["air_status"] == "currently_airing")
+
+    # If not airing, sort newest year at top
+    first = -int(a[x]['year'])
+
+    # If airing, sort by day of week and air time
+    if "air_status" in a[x] and a[x]["air_status"] == "currently_airing":
+        dow = a[x]["day_of_the_week"]
+        second = dow_nums[a[x]["day_of_the_week"]]
+        third = a[x]["start_time"]
+    else:
+        second = 0
+        third = 0
+
+    # Last resort, sort by name
+    fourth = x
+
+    return (zeroth, first, second, third, fourth)
+
+
+    return x
+
+def update_pages(**kwargs):
+    """update_pages."""
+    # Pages is a list of 2tuples: pagename, title-list
+    for archive, currentPage in zip(archives, pages):
+        for title in archive:
+            # If archive says show is in this category, but the page does not currently have it, add to page
+            if currentPage[0] == archive[title]['status'].replace('_',' ') and not title in currentPage[1]:
+                currentPage[1].append(title)
+            # If archive says show is NOT in this category, but the page DOES currently have it, remove from page
+            elif title in currentPage[1] and not currentPage[0] == archive[title]["status"]:
+                currentPage[1].remove(title)
+
+        a = archive
+        currentPage[1].sort(key=lambda x:ShowSort(x, a))
+
+
+def start_input():
+    curses.echo()
+    curses.nocbreak()
+    curses.raw()
+    curses.curs_set(True)
+
+def end_input():
+    curses.noecho()
+    curses.noraw()
+    curses.cbreak()
+    curses.curs_set(False)
+
+# Add (set) the filesystem path to a show's folder
+def add_path(screen, title=None, **kwargs):
+    """Set path to given anime's folder."""
+    title = title or pages[page][1][cursor]
+    screen.move(0,0)
+
+    if general_config["anime_root"] == None:
+        add_message(f"Error: Could not set path for {title}. Please set anime_root in ~/.config/amine/config.json", error=AmineError.Error)
+        return
+
+    start_input()
+    screen.clear()
+    screen.refresh()
+
+    screen.addstr(f"Give path for {title}: ")
+    path = ""
+    # TODO: Fix empty input path
+    while (inp := screen.getch()) != "\n":
+        if inp == curses.ascii.ctrl(ord("c")):
+            add_message("Canceled")
+            end_input()
+            screen.clear()
+            return
+        if inp == curses.ascii.ctrl(ord("d")) or inp == ord('\n'):
+            end_input
+            screen.clear()
+            break
+        path += chr(inp)
+
+    if not path:
+        add_message("No path specified.")
+        end_input()
+        return
+
+    root = general_config["anime_root"]
+
+    archives[page][title]['path'] = os.path.relpath(os.path.join(root, path), root)
+    save_archive(archives[page])
+
+    end_input()
+    screen.clear()
+    
+
+
+def update_archive(token, mal_status:Status, **kwargs):
+    """Update the local archive by fetching from MAL."""
+
+    add_message("getting list...")
+
+    l = get_list_status(token['access_token'], mal_status.name)
+
+    updated = set()
+
+    for node in l:
+        n = node['node']
+        title = n['title']
+        day_of_the_week = ""
+        start_time = ""
+        if 'broadcast' in n:
+            bc = n['broadcast']
+            try:
+                day_of_the_week = bc['day_of_the_week']
+            except:
+                day_of_the_week = None
+            try:
+                start_time = bc['start_time']
+            except:
+                start_time = None
+        air_status = n['status']     # Production info; upcoming, airing, aired, etc
+        status = node['list_status'] # Personal info; rating, my episodes, etc
+        statusname = status['status']
+        add_message(f"Updating {statusname}: {title}...")
+
+        # Initialize local title
+        if title not in archives[mal_status]:
+            add_message(f"{title} not in {statusname}; adding it...")
+            archives[mal_status][title] = {}
+            archives[mal_status][title]["path"] = ""
+            archives[mal_status][title]['id'] = n['id']
+            archives[mal_status][title]["year"] = get_anime_year(token['access_token'], n['id'])
+            archives[mal_status][title]['numEpisodes'] = get_anime_episode_count(token['access_token'], n['id'])
+
+        if 'day_of_the_week' not in archives[mal_status][title]:
+            archives[mal_status][title]['day_of_the_week'] = day_of_the_week
+
+        if 'start_time' not in archives[mal_status][title]:
+            archives[mal_status][title]['start_time'] = start_time
+
+        if 'air_status' not in archives[mal_status][title]:
+            archives[mal_status][title]['air_status'] = air_status
+
+        archives[mal_status][title]['status'] = status['status']
+        archives[mal_status][title]['curEp'] = status["num_episodes_watched"]
+        updated.add(title)
+
+    toRemove = []
+
+    for title in archives[mal_status]:
+        if title not in updated:
+            toRemove.append(title)
+
+    for title in toRemove:
+        archives[mal_status].pop(title)
+        try:
+            pages[page][1].remove(title)
+        except:
+            pass
+
+    add_message(f"Done updating {statusname}!")
+    save_archive(archives[mal_status])
+
+
+# Show message at bottom of screen; reversed colors if error
+def print_status(screen, s, error=False):
+    extra = ""
+    status = ""
+
+    match s:
+        case [message]:
+            status = message
+        case [message, *rest]:
+            status = message
+            extra = ": " + "".join(rest)
+
+    if screen == None:
+        print(status)
+        return
+
+    y, x = screen.getmaxyx()
+
+    sHeight = int(len(status)/x) + 1
+
+    # Clear line
+    screen.addstr(y-sHeight, 0, " "*(x-1)*sHeight)
+    # Show error
+    attr = curses.A_REVERSE if (error or status in ERRORS) else 0
+    status = (ERRORS[status] +  extra) if status in ERRORS else (status + extra)
+    screen.addstr(y-sHeight, 0, status, attr)
+    screen.refresh()
+
+
+def play_episode():
+    show = archives[page][pages[page][1][cursor]]
+    path = show["path"]
+
+    if general_config["anime_root"] == None:
+        add_message("Error: Please set anime_root in ~/.config/amine/config.json", error=AmineError.Error)
+        return
+
+    path = os.path.join(general_config["anime_root"], path)
+
+    curEp = int(show["curEp"])
+    numEpisodes = int(show["numEpisodes"])
+
+    # Airing shows may not have announced how many episodes there are
+    if numEpisodes != 0 and curEp >= numEpisodes:
+        curEp = show["curEp"] = 0
+
+    files = get_files(path)
+    files.sort(key=lambda x: x if "]" not in x else x.split("]",1)[1])
+
+    # We silence all output using >/dev/null 2>&1
+    # os.system stores the error code in the high byte, so shift by 8
+    pc = general_config["play_command"]
+    error = os.system(pc + ' ' + f'"{files[curEp]}" >/dev/null 2>&1') >> 8
+
+    if error:
+        add_message("Problem playing file: ", files[curEp].split("/")[-1], error=AmineError.PlayerError)
+    else:
+        id = show["id"]
+        show["curEp"]+=1
+        error = set_anime_episodes(token["access_token"], id, show["curEp"])
+        (error.status_code)
+
+def increment_episode(token, **kwargs):
+    """Add 1 to watched episode count without playing any video."""
+    show = archives[page][pages[page][1][cursor]]
+    show["curEp"] += 1
+    curEp = show["curEp"]
+    id = show["id"]
+    set_anime_episodes(token["access_token"], id, curEp)
+
+def amine_quit(**kwargs):
+    """Quit."""
+    for archive in archives:
+        save_archive(archive)
+    return 0
+
+def try_play(screen, **kwargs):
+    """Play next episode."""
+    title = pages[page][1][cursor]
+    if archives[page][title]["path"] == "":
+        screen.move(0,0)
+        add_path(screen)
+    else:
+        play_episode()
+
+def show_hotkeys(screen, **kwargs):
+    """Show hotkeys."""
+    screen.clear()
+    for hk, funcs in general_config["hotkeys"].items():
+        screen.addstr(hk.replace("\n", "\\n") + " - ")
+        match funcs:
+            # if there's one or more function names in an array...
+            case [funcName, *funcNames]:
+                # Display the first function
+                screen.addstr(str(CALLBACKS[funcName].__doc__) + "\n")
+                # Display any remaining functions
+                for funcName in funcNames:
+                    screen.addstr("    " + str(CALLBACKS[funcName].__doc__) + "\n")
+            # If there's just a function name...
+            case funcName:
+                # Display it
+                screen.addstr(str(CALLBACKS[funcName].__doc__) + "\n")
+        screen.addstr("\n")
+    screen.refresh()
+    _ = screen.getkey()
+    screen.clear()
+
+def print_title(screen, title, y):
+    show = archives[page][title]
+    title = title[:maxColumnSize]
+    year = show["year"]
+    numFiles = "--"
+
+    if show["path"]:
+        numFiles = len(get_files(os.path.join(general_config["anime_root"], show["path"])))
+
+    if 'numEpisodes' not in show:
+        update_archive(token, Status(page))
+
+    dow = '　 '
+    airtime = "     "
+    if 'air_status' in show and show['air_status'] == "currently_airing":
+        if 'day_of_the_week' in show:
+            dow = dow_names[show['day_of_the_week']] + str(dow_nums[show['day_of_the_week']])
+        if 'start_time' in show:
+            # We pick 2023-1-1 because it's a Monday
+            day = 1 + dow_nums[show['day_of_the_week']]
+            airtime = datetime.datetime.strptime(f"2023-01-0{day} {show['start_time']}", "%Y-%m-%d %H:%M")
+            # TODO: Daylight savings time
+            airtime -= datetime.timedelta(hours=13)
+            airtime = airtime.strftime("%a %H:%M")# + "(dow# " + str(dow_nums[show['day_of_the_week']])
+
+    missing = "" if show["path"] else "M"
+    s = f"{title:<{maxColumnSize}} {show['curEp']:>3}/{numFiles: <2} ({show['numEpisodes']:<2}) {year} {missing:<1} {airtime}"
+    attrs = curses.color_pair(2) if show['curEp'] == numFiles else curses.color_pair(8) if bool(missing) else 0
+
+    if y-3 == cursor - offset:
+        attrs |= curses.A_REVERSE
+
+    maxy, _ = screen.getmaxyx()
+    if y < maxy - 1:
+        screen.addstr(y, 0, s, attrs)
+
+
+CALLBACKS = {
+    "update_archive":    update_archive,
+    "amine_quit":        amine_quit,
+    "mark_completed":    mark_completed,
+    "mark_dropped":      mark_dropped,
+    "mark_watching":     mark_watching,
+    "add_path":          add_path,
+    "increment_episode": increment_episode,
+    "update_pages":      update_pages,
+    "try_play":          try_play,
+    "show_hotkeys":      show_hotkeys,
+    "open_mal":          open_mal,
+    "open_folder":       open_folder,
+}
+
+def Main(screen):
+    global cursor, page, offset
+
+    end_input()
+
+    # Enable transparent background
+    curses.use_default_colors()
+
+    curses.init_pair(0,-1, -1)  # White
+    curses.init_pair(1, 1, -1)  # Red
+    curses.init_pair(2, 2, -1)  # Green
+    curses.init_pair(8, 3, -1)  # Orange
+
+    update_pages()
+
+    while True:
+        x, y = 0, 1
+
+        for i, window in enumerate(pages):
+            screen.addstr(0, x, window[0], curses.A_REVERSE * (i == page))
+            x += len(window[0]) + 1
+        y+=1
+
+        screen.addstr(y, 0, f"{'Title':<{maxColumnSize}}  {'ep':<10} Year   Airs EST")
+        for title in pages[page][1][offset:]:
+            y+=1
+            print_title(screen, title, y)
+
+        cb_args = {
+            "screen": screen,
+            "token": token,
+            "mal_status": Status(page),
+        }
+
+        maxy, _ = screen.getmaxyx()
+        inp = screen.getkey()
+
+        if inp == "KEY_DOWN" and cursor < len(pages[page][1]) - 1:
+            cursor+=1
+            maxy, _ = screen.getmaxyx()
+            if cursor - offset >= maxy - 5:
+                offset = cursor - maxy + 5
+
+        elif inp == "KEY_UP" and cursor > 0:
+            cursor-=1
+            if cursor <= offset:
+                offset=cursor
+
+        elif inp == "KEY_RIGHT" and page < len(pages) - 1:
+            page+=1
+            cursor = 0
+            offset = 0
+            update_pages()
+            screen.clear()
+
+        elif inp == "KEY_LEFT" and page > 0:
+            page-=1
+            cursor = 0
+            offset = 0
+            update_pages()
+            screen.clear()
+
+        elif inp == "KEY_HOME":
+            cursor = 0
+            offset = 0
+
+        elif inp == "KEY_END":
+            cursor = len(pages[page][1])-1
+            offset = max(cursor - maxy + 5, 0)
+
+        elif inp == "KEY_RESIZE":
+            update_pages()
+
+        elif inp in general_config["hotkeys"]:
+
+            match general_config["hotkeys"][inp]:
+                case [*functions]:
+                    for funcName in functions:
+                        result = CALLBACKS[funcName](**cb_args)
+                        if isinstance(result, int):
+                            return result
+
+                case funcName:
+                    result = CALLBACKS[funcName](**cb_args)
+                    if isinstance(result, int):
+                        return result
+        print_status(screen, messages[-1][:-1], messages[-1][-1])
+        screen.refresh()
+
+
+if __name__ == "__main__":
+
+    if "--list-new" in sys.argv:
+        a = retrieve_archive(Status.watching)
+        for name, show in a.items():
+            if show["air_status"] != "currently_airing":
+                continue
+            if not show["path"]:
+                continue
+
+            numFiles = len(get_files(os.path.join(general_config["anime_root"], show["path"])))
+            curEp = show["curEp"] if "curEp" in show else 0
+            diff = numFiles - curEp
+            if diff:
+                sys.stdout.write(f"{diff:>2} NEW {name}\n")
+        exit(0)
+
+    try:
+        token = retrieve_token()
+    except FileNotFoundError:
+        code_verifier = code_challenge = get_new_code_verifier()
+        print_new_authorisation_url(code_challenge)
+        authorisation_code = input("Copy-paste the authorisation code: ").strip()
+        token = generate_new_token(authorisation_code, code_verifier)
+
+    token = retrieve_token()
+
+    if "aquired" in token:
+        # stored as string "datetime.datetime(y,m,d,h,m)"
+        parts = []
+        for part in token["aquired"].split(","):
+            part = ''.join(list(filter(lambda c: c.isdigit(), part)))
+            parts.append(int(part))
+
+        token["aquired"] = datetime.datetime(*parts)
+    else:
+        token["aquired"] = datetime.datetime(2000,1,1)
+
+
+    if (datetime.datetime.now() - token["aquired"]).days >= 30:
+        token = refresh_token(token["refresh_token"])
+        save_token()
+
+    for i in range(len(archives)):
+        #print(archives)
+        archives[i] = retrieve_archive(Status(i))
+
+    curses.wrapper(Main)
+    sys.exit(0)
